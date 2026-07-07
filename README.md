@@ -1,4 +1,4 @@
-# MultiStrategyEA v4.00 — Multi-Pair MetaTrader 5 Expert Advisor
+# MultiStrategyEA v4.10 — Multi-Pair MetaTrader 5 Expert Advisor
 
 > **Full manual: [USER-GUIDE.md](USER-GUIDE.md)** — step-by-step MT5 install,
 > every input explained, balance handling, backtest workflow, live checklist, FAQ.
@@ -21,6 +21,8 @@ the basket (empty = all symbols):
 - `Mean reversion: only these symbols` — default `EURUSD,GBPUSD,AUDUSD,USDCAD`
   (**excludes XAUUSD and USDJPY** — fading gold/yen trends is how MR dies)
 - `Breakout: only these symbols` — default empty
+- `Scalping: only these symbols` — default `EURUSD,GBPUSD` (tightest spreads;
+  scalping dies on wide-spread symbols)
 
 Filters match by prefix, so `EURUSD` also matches broker `EURUSD.m`.
 
@@ -31,6 +33,21 @@ Filters match by prefix, so `EURUSD` also matches broker `EURUSD.m`.
 | 1 | Trend following | EMA 20/50 cross + ADX ≥ 22 + DI± agreement + H4 trend alignment | TP ladder: +1R bank 50% + breakeven, +2R bank 50% of rest + lock +1R, remainder ATR-trails to 4-ATR TP | 610001 |
 | 2 | Mean reversion | RSI ≤ 30 / ≥ 70 **and** close outside Bollinger, ADX ≤ 25 | Live TP order at Bollinger middle band (re-anchored every bar, fills intrabar), ATR stop, 24-bar time stop | 610002 |
 | 3 | London breakout | Close breaks 00:00–07:00 range; range must be 0.3–3.0× ATR; one long + one short per day per symbol | TP = 1× range height, ATR stop | 610003 |
+| 4 | Scalping (v4.10) | EMA 9/21 cross on M5 (own timeframe, independent of working TF), strict spread filter (≤20% of M5 ATR) | Close TP at 1.0× ATR, SL 1.2× ATR, breakeven at +0.5 ATR, 24-bar time stop | 610004 |
+
+## Profit taking (v4.10)
+
+Four ways to bank profit, all optional, all stackable:
+
+- **Daily profit target** (default **+2%**, 0=off) — day's equity gain hits the
+  target → close everything, pause new entries until tomorrow. Banks the day.
+- **Per-trade ATR profit close** (default off) — any position whose open profit
+  reaches N× ATR is closed immediately, overriding the normal exit.
+- **Time-of-day profit close** (default off) — at a set server hour, once per
+  day, close only the positions currently in profit; losers keep their
+  stops/targets and stay managed.
+- **Equity target** (default off) — account equity reaches an absolute number →
+  close all and halt. "Get me from 1000 to 1200, then stop."
 
 ## Risk layers (portfolio-aware)
 

@@ -1,4 +1,4 @@
-# MultiStrategyEA v4.00 — Complete User Guide
+# MultiStrategyEA v4.10 — Complete User Guide
 
 Step-by-step manual: install, configure, backtest, go live, and understand how
 the EA manages your account balance.
@@ -17,6 +17,8 @@ strategies at once:
    profit at the Bollinger middle band. Disabled on gold/yen by default.
 3. **London breakout** — trades the break of the Asian-session range at London
    open, with range-quality filters.
+4. **Scalping** — fast EMA 9/21 crosses on M5 with a close 1-ATR take profit,
+   breakeven move, and time stop. EURUSD/GBPUSD only by default (spread-sensitive).
 
 Every stop, target, and filter is ATR-relative, so the same settings adapt to
 each pair's volatility automatically.
@@ -86,7 +88,18 @@ Unknown symbols are skipped with a journal message (*Toolbox → Experts* tab).
 |---|---|---|
 | Symbols | EURUSD,…,XAUUSD | Basket, comma-separated. Empty = chart symbol only. |
 | Symbol suffix | (empty) | Broker suffix, e.g. `.m`. |
-| Trend/MR/Breakout: only these symbols | see defaults | Per-strategy allowlist; empty = all basket symbols. MR default excludes XAUUSD & USDJPY on purpose. |
+| Trend/MR/Breakout/Scalping: only these symbols | see defaults | Per-strategy allowlist; empty = all basket symbols. MR default excludes XAUUSD & USDJPY on purpose; Scalping default is EURUSD,GBPUSD (tight spreads only). |
+
+### Profit Taking / Targets (v4.10)
+| Input | Default | Meaning |
+|---|---|---|
+| Daily profit target % | 2.0 | Day's equity gain hits this → **close all positions**, no new entries until next day. Banks the day; dashboard shows "PAUSED (daily profit target banked)". 0 = off. |
+| Close trade in profit ≥ N ATRs | 0 (off) | Any position whose open profit reaches N× ATR (working TF) is closed immediately. Set e.g. 2.0 to cash winners earlier than the normal exits. |
+| Profit-close hour | −1 (off) | Once per day at this server hour, close **only positions in profit**; losing positions keep their stops/targets. E.g. 21 = bank winners before rollover/swap. |
+| Equity target | 0 (off) | Absolute equity number: reached → close all + halt (manual re-attach to resume). "Grow 1000 → 1200 then stop." |
+
+These stack: you can run daily target + profit-close hour together. All are
+independent of the per-strategy exits, which keep working underneath.
 
 ### Risk & Protection
 | Input | Default | Meaning |
@@ -131,8 +144,16 @@ your broker must supply calendar data (most do).
 ### Strategy blocks
 Trend (EMA periods, ADX min, SL/TP/trail ATR multiples, TP-ladder switches),
 Mean reversion (RSI/Bollinger periods and thresholds, time stop), Breakout
-(range hours, range quality ATR bounds, SL/TP). Defaults are sane baselines —
+(range hours, range quality ATR bounds, SL/TP), Scalping (own timeframe
+default M5, EMA 9/21, SL 1.2 / TP 1.0 ATR, breakeven at +0.5 ATR, 24-bar time
+stop, own spread filter ≤20% of M5 ATR). Defaults are sane baselines —
 change them through backtesting, not guessing.
+
+**Scalping notes:** runs on its own timeframe (M5 default) regardless of the
+working TF, so it trades far more often than the other strategies. It is the
+most spread/commission-sensitive strategy — backtest with real ticks and your
+live broker's spreads before enabling on a live account; disable it (or keep
+the EURUSD,GBPUSD allowlist) if your broker's spreads are wide.
 
 **Breakout hours are server time.** Find your broker's UTC offset (Market Watch
 clock vs UTC) and shift `Range start/end` so the range ends at London open
@@ -178,7 +199,7 @@ clock vs UTC) and shift `Range start/end` so the range ends at London open
 ## 7. Reading the dashboard
 
 ```
-MultiStrategyEA v4.00  |  TRADING
+MultiStrategyEA v4.10  |  TRADING
 Balance: 1000.00 USD   Equity: 1012.40 USD
 Today: +1.24%   Drawdown from peak: 0.00%
 Open positions: 2 / 6   Open risk: 1.38% / 4.00%
@@ -190,10 +211,11 @@ Extra states: `THROTTLED 50% (3 losses)` appears next to risk when the
 loss-streak throttle is active; `News blackout: <currencies>` lists currencies
 currently blocked around high-impact events.
 
-- **TRADING** — normal. **PAUSED** — daily loss limit hit, resumes next day
-  automatically. **HALTED** — drawdown/equity floor hit; EA will not resume
+- **TRADING** — normal. **PAUSED** — daily loss limit **or daily profit
+  target** hit (the text says which), resumes next day automatically.
+  **HALTED** — drawdown/equity floor/equity **target** hit; EA will not resume
   until you remove and re-attach it (deliberate: a 15% drawdown means review,
-  not auto-retry).
+  not auto-retry — and a reached profit target means decide your next goal).
 - **Open risk** — money lost if every open position hits its stop right now,
   as % of equity. Positions moved to breakeven count as 0.
 

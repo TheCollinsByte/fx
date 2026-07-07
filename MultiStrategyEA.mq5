@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                             MultiStrategyEA.mq5  |
-//|  Multi-strategy, multi-symbol Expert Advisor for MT5   v4.00     |
+//|  Multi-strategy, multi-symbol Expert Advisor for MT5   v4.10     |
 //|                                                                  |
 //|  Attach to ONE chart; trades a whole basket of pairs from        |
 //|  InpSymbols. All distance parameters are ATR-relative, so the    |
@@ -14,6 +14,13 @@
 //|                         exit at middle band or time stop         |
 //|    3. Session breakout: London-open range breakout with          |
 //|                         ATR-based stop and range quality filter  |
+//|    4. Scalping        : fast EMA cross on M5, tight ATR stop,    |
+//|                         close TP, breakeven, time stop           |
+//|                                                                  |
+//|  Profit taking (v4.10):                                          |
+//|    - Daily profit target: bank the day, pause until tomorrow     |
+//|    - Per-trade ATR profit close, time-of-day profit-only close   |
+//|    - Absolute equity target: close all + halt                    |
 //|                                                                  |
 //|  Risk management:                                                |
 //|    - Position size from % equity risk, margin-capped             |
@@ -23,7 +30,7 @@
 //|    - Trading session window, Friday flat option                  |
 //+------------------------------------------------------------------+
 #property copyright "collo"
-#property version   "4.00"
+#property version   "4.10"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -35,6 +42,14 @@ input string InpSymbolSuffix     = "";     // Broker symbol suffix (e.g. ".m", "
 input string InpTrendSymbols     = "";     // Trend: only these symbols (empty = all)
 input string InpMR_Symbols       = "EURUSD,GBPUSD,AUDUSD,USDCAD"; // Mean reversion: only these symbols (empty = all)
 input string InpBO_Symbols       = "";     // Breakout: only these symbols (empty = all)
+input string InpSC_Symbols       = "EURUSD,GBPUSD"; // Scalping: only these symbols (empty = all)
+
+//--- Profit taking
+input group "=== Profit Taking / Targets ==="
+input double InpDailyProfitPct   = 2.0;    // Daily profit target %: close all + pause until next day (0=off)
+input double InpProfitCloseATR   = 0.0;    // Close any trade once profit >= this many ATRs (0=off)
+input int    InpProfitCloseHour  = -1;     // Server hour to close trades in profit, once daily (-1=off)
+input double InpEquityTarget     = 0.0;    // Equity target: close all + halt at this equity (0=off)
 
 //--- Risk inputs
 input group "=== Risk & Protection ==="
@@ -109,6 +124,19 @@ input double InpBO_SL_ATR        = 1.5;    // Stop loss (ATR multiples)
 input double InpBO_TP_RangeMult  = 1.0;    // Take profit (range-height multiples)
 input long   InpBO_Magic         = 610003; // Magic number
 
+//--- Scalping inputs
+input group "=== Strategy 4: Scalping ==="
+input bool   InpSC_Enabled       = true;   // Enable scalping strategy
+input ENUM_TIMEFRAMES InpSC_TF   = PERIOD_M5; // Scalping timeframe
+input int    InpSC_FastEMA       = 9;      // Scalp fast EMA period
+input int    InpSC_SlowEMA       = 21;     // Scalp slow EMA period
+input double InpSC_SL_ATR        = 1.2;    // Scalp stop loss (scalp-TF ATR multiples)
+input double InpSC_TP_ATR        = 1.0;    // Scalp take profit (scalp-TF ATR multiples)
+input double InpSC_BE_ATR        = 0.5;    // Move SL to breakeven after this many ATRs profit (0=off)
+input int    InpSC_MaxBars       = 24;     // Time stop in scalp-TF bars (0=off)
+input double InpSC_MaxSpreadPct  = 20.0;   // Max spread as % of scalp-TF ATR
+input long   InpSC_Magic         = 610004; // Magic number
+
 //--- Shared
 input group "=== Shared ==="
 input ENUM_TIMEFRAMES InpTF      = PERIOD_H1; // Working timeframe (all symbols)
@@ -128,6 +156,11 @@ struct SymbolContext
    int      hBands;
    int      hATR;
    datetime lastBarTime;
+   // scalping (own timeframe)
+   int      hSC_Fast;
+   int      hSC_Slow;
+   int      hSC_ATR;
+   datetime lastScalpBarTime;
    // breakout state (reset daily)
    double   boRangeHigh;
    double   boRangeLow;
@@ -147,6 +180,8 @@ double   g_dayStartEquity = 0.0;
 double   g_equityPeak     = 0.0;
 bool     g_haltedToday    = false;
 bool     g_haltedTotal    = false;
+bool     g_dailyTargetHit = false;   // today's pause was a profit target, not a loss
+datetime g_profitCloseDay = 0;       // last day the time-based profit close ran
 
 int      g_lossStreak     = 0;      // consecutive losing closed trades
 datetime g_newsCacheTime  = 0;      // last calendar sweep
@@ -199,7 +234,11 @@ int OnInit()
       ctx.hHTF_EMA    = InpTrendUseHTF
                         ? iMA(s, InpTrendHTF, InpTrendHTF_EMA, 0, MODE_EMA, PRICE_CLOSE)
                         : INVALID_HANDLE;
+      ctx.hSC_Fast    = InpSC_Enabled ? iMA(s, InpSC_TF, InpSC_FastEMA, 0, MODE_EMA, PRICE_CLOSE) : INVALID_HANDLE;
+      ctx.hSC_Slow    = InpSC_Enabled ? iMA(s, InpSC_TF, InpSC_SlowEMA, 0, MODE_EMA, PRICE_CLOSE) : INVALID_HANDLE;
+      ctx.hSC_ATR     = InpSC_Enabled ? iATR(s, InpSC_TF, InpATRPeriod) : INVALID_HANDLE;
       ctx.lastBarTime = 0;
+      ctx.lastScalpBarTime = 0;
       ctx.boRangeHigh = 0.0;
       ctx.boRangeLow  = 0.0;
       ctx.boRangeSet  = false;
@@ -209,7 +248,10 @@ int OnInit()
       if(ctx.hFastEMA == INVALID_HANDLE || ctx.hSlowEMA == INVALID_HANDLE ||
          ctx.hADX == INVALID_HANDLE || ctx.hRSI == INVALID_HANDLE ||
          ctx.hBands == INVALID_HANDLE || ctx.hATR == INVALID_HANDLE ||
-         (InpTrendUseHTF && ctx.hHTF_EMA == INVALID_HANDLE))
+         (InpTrendUseHTF && ctx.hHTF_EMA == INVALID_HANDLE) ||
+         (InpSC_Enabled && (ctx.hSC_Fast == INVALID_HANDLE ||
+                            ctx.hSC_Slow == INVALID_HANDLE ||
+                            ctx.hSC_ATR == INVALID_HANDLE)))
         {
          PrintFormat("Indicator handles failed for %s", s);
          return(INIT_FAILED);
@@ -226,7 +268,7 @@ int OnInit()
       Print("No valid symbols — nothing to trade");
       return(INIT_FAILED);
      }
-   PrintFormat("MultiStrategyEA v4.00: trading %d symbols on %s",
+   PrintFormat("MultiStrategyEA v4.10: trading %d symbols on %s",
                g_nSymbols, EnumToString(InpTF));
 
    g_equityPeak = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -252,6 +294,12 @@ void OnDeinit(const int reason)
       IndicatorRelease(g_ctx[i].hATR);
       if(g_ctx[i].hHTF_EMA != INVALID_HANDLE)
          IndicatorRelease(g_ctx[i].hHTF_EMA);
+      if(g_ctx[i].hSC_Fast != INVALID_HANDLE)
+         IndicatorRelease(g_ctx[i].hSC_Fast);
+      if(g_ctx[i].hSC_Slow != INVALID_HANDLE)
+         IndicatorRelease(g_ctx[i].hSC_Slow);
+      if(g_ctx[i].hSC_ATR != INVALID_HANDLE)
+         IndicatorRelease(g_ctx[i].hSC_ATR);
      }
   }
 
@@ -290,6 +338,18 @@ void ProcessAll()
    if(g_haltedTotal)
       return;
 
+   // time-of-day profit-only close: once per day, close winners, keep losers managed
+   if(InpProfitCloseHour >= 0 && g_profitCloseDay != g_currentDay)
+     {
+      MqlDateTime nowSt;
+      TimeToStruct(TimeCurrent(), nowSt);
+      if(nowSt.hour >= InpProfitCloseHour)
+        {
+         g_profitCloseDay = g_currentDay;
+         CloseProfitablePositions();
+        }
+     }
+
    bool inSession = InSessionWindow();
 
    for(int i = 0; i < g_nSymbols; i++)
@@ -297,6 +357,17 @@ void ProcessAll()
       // management runs on every call, even when entries halted
       if(InpTrendEnabled)
          ManageTrendPositions(g_ctx[i]);
+      if(InpProfitCloseATR > 0.0)
+         ApplyProfitCloseATR(g_ctx[i]);
+
+      if(InpSC_Enabled)
+        {
+         ManageScalpPositions(g_ctx[i]);
+         if(IsNewScalpBar(g_ctx[i]) && !g_haltedToday && inSession &&
+            StrategyAllows(InpSC_Symbols, g_ctx[i].name) &&
+            ScalpSpreadOK(g_ctx[i]) && !NewsBlocked(g_ctx[i].name))
+            RunScalpStrategy(g_ctx[i]);
+        }
 
       if(!IsNewBar(g_ctx[i]))
          continue;
@@ -331,6 +402,7 @@ void UpdateProtectionState()
       g_currentDay     = today;
       g_dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
       g_haltedToday    = false;
+      g_dailyTargetHit = false;
       for(int i = 0; i < g_nSymbols; i++)
         {
          g_ctx[i].boRangeSet  = false;
@@ -351,6 +423,27 @@ void UpdateProtectionState()
          g_haltedToday = true;
          Notify(StringFormat("Daily loss limit hit (%.2f%%). No new entries until next day.", lossPct));
         }
+     }
+
+   // daily profit target: bank the day, pause new entries until tomorrow
+   if(!g_haltedToday && InpDailyProfitPct > 0.0 && g_dayStartEquity > 0.0)
+     {
+      double gainPct = (equity - g_dayStartEquity) / g_dayStartEquity * 100.0;
+      if(gainPct >= InpDailyProfitPct)
+        {
+         g_haltedToday    = true;
+         g_dailyTargetHit = true;
+         Notify(StringFormat("Daily profit target hit (%+.2f%%). Closing all — day banked, resumes tomorrow.", gainPct));
+         CloseAllOwnPositions();
+        }
+     }
+
+   // absolute equity target: mission accomplished — close all and halt
+   if(!g_haltedTotal && InpEquityTarget > 0.0 && equity >= InpEquityTarget)
+     {
+      g_haltedTotal = true;
+      Notify(StringFormat("Equity target %.2f reached (equity %.2f). Closing all and halting.", InpEquityTarget, equity));
+      CloseAllOwnPositions();
      }
 
    if(!g_haltedTotal && InpMaxTotalDDPct > 0.0 && g_equityPeak > 0.0)
@@ -544,9 +637,11 @@ void UpdateDashboard()
 
    string status = "TRADING";
    if(g_haltedTotal)
-      status = "HALTED (drawdown/equity floor)";
+      status = "HALTED (drawdown/equity floor/target reached)";
    else if(g_haltedToday)
-      status = "PAUSED (daily loss limit, resumes next day)";
+      status = g_dailyTargetHit
+               ? "PAUSED (daily profit target banked, resumes next day)"
+               : "PAUSED (daily loss limit, resumes next day)";
 
    string throttle = (RiskFactor() < 1.0)
                      ? StringFormat("  THROTTLED %.0f%% (%d losses)", RiskFactor() * 100.0, g_lossStreak)
@@ -556,7 +651,7 @@ void UpdateDashboard()
                  : "";
 
    string text =
-      "MultiStrategyEA v4.00  |  " + status + "\n" +
+      "MultiStrategyEA v4.10  |  " + status + "\n" +
       StringFormat("Balance: %.2f %s   Equity: %.2f %s\n", balance, currency, equity, currency) +
       StringFormat("Today: %+.2f%%   Drawdown from peak: %.2f%%\n", dayPnl, ddPct) +
       StringFormat("Open positions: %d / %d   Open risk: %.2f%% / %.2f%%\n",
@@ -651,7 +746,52 @@ bool StrategyAllows(string listStr, string sym)
 //+------------------------------------------------------------------+
 bool IsOwnMagic(long magic)
   {
-   return(magic == InpTrendMagic || magic == InpMR_Magic || magic == InpBO_Magic);
+   return(magic == InpTrendMagic || magic == InpMR_Magic ||
+          magic == InpBO_Magic   || magic == InpSC_Magic);
+  }
+
+//+------------------------------------------------------------------+
+//| Close every own position currently in profit (winners banked,    |
+//| losers keep their stops/targets and stay managed).               |
+//+------------------------------------------------------------------+
+void CloseProfitablePositions()
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(!g_pos.SelectByIndex(i))
+         continue;
+      if(!IsOwnSymbol(g_pos.Symbol()) || !IsOwnMagic(g_pos.Magic()))
+         continue;
+      if(g_pos.Profit() + g_pos.Swap() > 0.0)
+         g_trade.PositionClose(g_pos.Ticket());
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Per-trade profit close: bank any position once its open profit   |
+//| distance reaches InpProfitCloseATR x ATR (working timeframe).    |
+//+------------------------------------------------------------------+
+void ApplyProfitCloseATR(SymbolContext &ctx)
+  {
+   double atr = GetATR(ctx);
+   if(atr == EMPTY_VALUE || atr <= 0.0)
+      return;
+   double target = InpProfitCloseATR * atr;
+   double bid = SymbolInfoDouble(ctx.name, SYMBOL_BID);
+   double ask = SymbolInfoDouble(ctx.name, SYMBOL_ASK);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(!g_pos.SelectByIndex(i))
+         continue;
+      if(g_pos.Symbol() != ctx.name || !IsOwnMagic(g_pos.Magic()))
+         continue;
+      double profitDist = (g_pos.PositionType() == POSITION_TYPE_BUY)
+                          ? bid - g_pos.PriceOpen()
+                          : g_pos.PriceOpen() - ask;
+      if(profitDist >= target)
+         g_trade.PositionClose(g_pos.Ticket());
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -1143,6 +1283,131 @@ void RunBreakoutStrategy(SymbolContext &ctx)
       double tp  = bid - InpBO_TP_RangeMult * rangeHeight;
       if(OpenPosition(ctx.name, InpBO_Magic, ORDER_TYPE_SELL, sl, tp, "BO-S"))
          ctx.boShortDone = true;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Strategy 4: scalping — helpers                                   |
+//+------------------------------------------------------------------+
+double GetScalpATR(SymbolContext &ctx)
+  {
+   return(GetBuffer(ctx.hSC_ATR, 0, 1));
+  }
+
+//+------------------------------------------------------------------+
+bool IsNewScalpBar(SymbolContext &ctx)
+  {
+   datetime barTime = iTime(ctx.name, InpSC_TF, 0);
+   if(barTime > 0 && barTime != ctx.lastScalpBarTime)
+     {
+      ctx.lastScalpBarTime = barTime;
+      return(true);
+     }
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Scalping is spread-sensitive: own filter vs scalp-TF ATR         |
+//+------------------------------------------------------------------+
+bool ScalpSpreadOK(SymbolContext &ctx)
+  {
+   if(InpSC_MaxSpreadPct <= 0.0)
+      return(true);
+   double atr = GetScalpATR(ctx);
+   if(atr == EMPTY_VALUE || atr <= 0.0)
+      return(false);
+   double point  = SymbolInfoDouble(ctx.name, SYMBOL_POINT);
+   double spread = (double)SymbolInfoInteger(ctx.name, SYMBOL_SPREAD) * point;
+   return(spread <= atr * InpSC_MaxSpreadPct / 100.0);
+  }
+
+//+------------------------------------------------------------------+
+//| Strategy 4: scalping — entries (fast EMA cross on scalp TF)      |
+//+------------------------------------------------------------------+
+void RunScalpStrategy(SymbolContext &ctx)
+  {
+   if(CountPositions(ctx.name, InpSC_Magic) >= InpMaxPosPerStrat)
+      return;
+
+   double fast1 = GetBuffer(ctx.hSC_Fast, 0, 1);
+   double fast2 = GetBuffer(ctx.hSC_Fast, 0, 2);
+   double slow1 = GetBuffer(ctx.hSC_Slow, 0, 1);
+   double slow2 = GetBuffer(ctx.hSC_Slow, 0, 2);
+   double atr   = GetScalpATR(ctx);
+
+   if(fast1 == EMPTY_VALUE || fast2 == EMPTY_VALUE || slow1 == EMPTY_VALUE ||
+      slow2 == EMPTY_VALUE || atr == EMPTY_VALUE || atr <= 0.0)
+      return;
+
+   bool crossUp   = (fast2 <= slow2 && fast1 > slow1);
+   bool crossDown = (fast2 >= slow2 && fast1 < slow1);
+   if(!crossUp && !crossDown)
+      return;
+
+   if(crossUp)
+     {
+      double ask = SymbolInfoDouble(ctx.name, SYMBOL_ASK);
+      double sl  = ask - InpSC_SL_ATR * atr;
+      double tp  = ask + InpSC_TP_ATR * atr;
+      OpenPosition(ctx.name, InpSC_Magic, ORDER_TYPE_BUY, sl, tp, "Scalp-L");
+     }
+   else
+     {
+      double bid = SymbolInfoDouble(ctx.name, SYMBOL_BID);
+      double sl  = bid + InpSC_SL_ATR * atr;
+      double tp  = bid - InpSC_TP_ATR * atr;
+      OpenPosition(ctx.name, InpSC_Magic, ORDER_TYPE_SELL, sl, tp, "Scalp-S");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Strategy 4: scalping — breakeven move and time stop              |
+//+------------------------------------------------------------------+
+void ManageScalpPositions(SymbolContext &ctx)
+  {
+   double atr = GetScalpATR(ctx);
+   if(atr == EMPTY_VALUE || atr <= 0.0)
+      return;
+   int digits = (int)SymbolInfoInteger(ctx.name, SYMBOL_DIGITS);
+   double point = SymbolInfoDouble(ctx.name, SYMBOL_POINT);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(!g_pos.SelectByIndex(i))
+         continue;
+      if(g_pos.Symbol() != ctx.name || g_pos.Magic() != InpSC_Magic)
+         continue;
+
+      ulong  ticket = g_pos.Ticket();
+      double open   = g_pos.PriceOpen();
+      double sl     = g_pos.StopLoss();
+      double tp     = g_pos.TakeProfit();
+      bool   isBuy  = (g_pos.PositionType() == POSITION_TYPE_BUY);
+      double bid    = SymbolInfoDouble(ctx.name, SYMBOL_BID);
+      double ask    = SymbolInfoDouble(ctx.name, SYMBOL_ASK);
+
+      // time stop: scalp thesis expires fast
+      if(InpSC_MaxBars > 0)
+        {
+         int barsHeld = Bars(ctx.name, InpSC_TF, g_pos.Time(), TimeCurrent()) - 1;
+         if(barsHeld >= InpSC_MaxBars)
+           {
+            g_trade.PositionClose(ticket);
+            continue;
+           }
+        }
+
+      // breakeven once the trade has moved InpSC_BE_ATR x ATR in our favor
+      if(InpSC_BE_ATR > 0.0)
+        {
+         double profitDist = isBuy ? (bid - open) : (open - ask);
+         bool   beDone     = isBuy ? (sl >= open) : (sl > 0.0 && sl <= open);
+         if(!beDone && profitDist >= InpSC_BE_ATR * atr)
+           {
+            double beSL = isBuy ? open + 2 * point : open - 2 * point;
+            g_trade.PositionModify(ticket, NormalizeDouble(beSL, digits), tp);
+           }
+        }
      }
   }
 
